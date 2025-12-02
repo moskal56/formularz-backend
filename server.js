@@ -1,102 +1,138 @@
 const express = require("express");
 const cors = require("cors");
-const fetch = require("node-fetch"); // WAŻNE
-require("dotenv").config();
+const fetch = require("node-fetch");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Dane Twojego repo
+// KONFIG GITHUBA
 const OWNER = "moskal56";
 const REPO = "formularz-backend";
-const FILE = "orders.json";
+const FILE_PATH = "orders.json";
 const BRANCH = "main";
+const TOKEN = process.env.GITHUB_TOKEN; // NAZWA ZMIENNEJ W RENDERZE
 
-// Endpoint GET — pobiera aktualny plik z GitHuba
+if (!TOKEN) {
+  console.error("⚠ Brak zmiennej GITHUB_TOKEN w środowisku!");
+}
+
+// --- POMOCNICZE FUNKCJE ---
+
+// Pobranie orders.json z GitHuba
+async function getOrdersFromGitHub() {
+  const url = `https://api.github.com/repos/${OWNER}/${REPO}/contents/${FILE_PATH}?ref=${BRANCH}`;
+
+  const res = await fetch(url, {
+    headers: {
+      Accept: "application/vnd.github+json",
+      ...(TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {}),
+    },
+  });
+
+  // Jeśli plik nie istnieje → traktujemy jako pustą tablicę
+  if (res.status === 404) {
+    return { orders: [], sha: null };
+  }
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`GitHub GET ${res.status}: ${text}`);
+  }
+
+  const data = await res.json();
+  const decoded = Buffer.from(data.content, "base64").toString("utf8");
+  const orders = JSON.parse(decoded || "[]");
+
+  return { orders, sha: data.sha };
+}
+
+// Zapis orders.json do GitHuba (PUT + commit)
+async function saveOrdersToGitHub(orders, sha) {
+  const url = `https://api.github.com/repos/${OWNER}/${REPO}/contents/${FILE_PATH}`;
+
+  const newContentBase64 = Buffer.from(
+    JSON.stringify(orders, null, 2),
+    "utf8"
+  ).toString("base64");
+
+  const body = {
+    message: "Update orders.json via API",
+    content: newContentBase64,
+    branch: BRANCH,
+  };
+
+  if (sha) {
+    body.sha = sha; // update istniejącego pliku
+  }
+
+  const res = await fetch(url, {
+    method: "PUT",
+    headers: {
+      Accept: "application/vnd.github+json",
+      Authorization: `Bearer ${TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`GitHub PUT ${res.status}: ${text}`);
+  }
+
+  return res.json();
+}
+
+// --- ENDPOINTY ---
+
+// GET /orders — czytaj z GitHuba
 app.get("/orders", async (req, res) => {
   try {
-    const response = await fetch(
-      `https://api.github.com/repos/${OWNER}/${REPO}/contents/${FILE}`,
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.GITHUB_PAT}`,
-          Accept: "application/vnd.github+json",
-        },
-      }
-    );
-
-    const data = await response.json();
-
-    if (!data.content) {
-      return res.json([]);
-    }
-
-    const content = Buffer.from(data.content, "base64").toString();
-    const json = JSON.parse(content);
-
-    res.json(json);
-  } catch (error) {
-    console.error("Błąd GET:", error);
-    res.status(500).json({ error: "Błąd pobierania danych" });
+    const { orders } = await getOrdersFromGitHub();
+    res.json(orders);
+  } catch (err) {
+    console.error("Błąd GET /orders:", err);
+    res.status(500).json({ error: "Błąd pobierania zamówień", details: err.message });
   }
 });
 
-// Endpoint POST — dodaje zamówienie do GitHuba
+// POST /orders — dodaj zamówienie i zapisz w GitHubie
 app.post("/orders", async (req, res) => {
   try {
-    const nowyRekord = req.body;
+    const { imie, nazwisko, budzet, data } = req.body;
 
-    // 1. Pobieramy aktualny plik
-    const response = await fetch(
-      `https://api.github.com/repos/${OWNER}/${REPO}/contents/${FILE}`,
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.GITHUB_PAT}`,
-          Accept: "application/vnd.github+json",
-        },
-      }
-    );
+    if (!imie || !nazwisko || !budzet || !data) {
+      return res.status(400).json({ error: "Brak wymaganych pól" });
+    }
 
-    const data = await response.json();
+    const { orders, sha } = await getOrdersFromGitHub();
 
-    const sha = data.sha;
-    const content = data.content
-      ? JSON.parse(Buffer.from(data.content, "base64").toString())
-      : [];
+    const newOrder = {
+      id: Date.now(),
+      imie,
+      nazwisko,
+      budzet,
+      data,
+    };
 
-    // 2. Dodajemy nowy element
-    content.push(nowyRekord);
+    const updatedOrders = [...orders, newOrder];
 
-    // 3. Kodujemy i wysyłamy z powrotem do GitHuba
-    const newContent = Buffer.from(JSON.stringify(content, null, 2)).toString(
-      "base64"
-    );
+    await saveOrdersToGitHub(updatedOrders, sha);
 
-    const update = await fetch(
-      `https://api.github.com/repos/${OWNER}/${REPO}/contents/${FILE}`,
-      {
-        method: "PUT",
-        headers: {
-          Authorization: `Bearer ${process.env.GITHUB_PAT}`,
-          Accept: "application/vnd.github+json",
-        },
-        body: JSON.stringify({
-          message: "Dodano nowe zamówienie",
-          content: newContent,
-          sha: sha,
-          branch: BRANCH,
-        }),
-      }
-    );
-
-    const updateResult = await update.json();
-
-    res.json({ status: "OK", github: updateResult });
-  } catch (error) {
-    console.error("Błąd POST:", error);
-    res.status(500).json({ error: "Błąd zapisu danych" });
+    res.status(201).json(newOrder);
+  } catch (err) {
+    console.error("Błąd POST /orders:", err);
+    res.status(500).json({ error: "Błąd zapisu zamówienia", details: err.message });
   }
 });
 
-app.listen(4000, () => console.log("Backend działa na porcie 4000"));
+// Test root
+app.get("/", (req, res) => {
+  res.send("API działa 🚀 (GitHub storage)");
+});
+
+const PORT = process.env.PORT || 4000;
+app.listen(PORT, () => {
+  console.log(`Serwer działa na porcie ${PORT}`);
+});
